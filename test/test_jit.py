@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import unittest
 from contextlib import contextmanager
-from itertools import product
+from itertools import product, chain
 import torch.jit.frontend
 from torch.autograd import Variable, Function
 from torch.autograd.function import traceable
@@ -1644,6 +1644,67 @@ class TestJit(TestCase):
             return a + a + a
         s = Variable(torch.rand(2))
         self.assertEqual(s + s + s, foo(s))
+
+    def test_traced_module(self):
+        class Model(nn.Module):
+            def __init__(self, num_features, num_layers):
+                super(Model, self).__init__()
+                self.num_layers = num_layers
+                layers = [[nn.Linear(num_features, num_features), nn.Sigmoid()]
+                          for _ in range(num_layers)]
+                self.submodule = nn.Sequential(*chain(*layers))
+
+            def forward(self, x):
+                for i in range(self.num_layers):
+                    x = self.submodule[i](x) + x
+                return x
+
+        model = Model(5, 3)
+        x = torch.randn(2, 5)
+        traced_model = torch.jit.trace(x)(model)
+
+        # We're missing some attributes these modules had initially. Make sure we can
+        # still get the __repr__()
+        model.__repr__()
+
+        # Verify that Sequential still has __getitem__ (not implemented in Module)
+        linear_submodule = traced_model.submodule[0]
+
+        # All attributes that aren't parameters should raise
+        with self.assertRaises(AttributeError):
+            linear_submodule.in_features
+        linear_submodule.weight
+        with self.assertRaises(RuntimeError):
+            traced_model.asdf = 4
+        linear_submodule.weight = nn.Parameter(torch.randn(linear_submodule.weight.shape))
+        with self.assertRaises(RuntimeError):
+            del linear_submodule.weight
+
+        # Submodules can't be called
+        with self.assertRaises(RuntimeError):
+            linear_submodule(x)
+
+        # Type casts
+        with self.assertRaises(RuntimeError):
+            linear_submodule.cuda()
+        traced_model.float().cuda()
+        cuda_out = traced_model(x.float().cuda())
+        traced_model.cpu()
+        cpu_out = traced_model(x.float())
+        self.assertEqual(cpu_out, cuda_out)
+        traced_model.double()
+
+        # state_dict + load_state_dict
+        state = {k: v.clone() for k, v in traced_model.state_dict().items()}
+        new_state = {k: v.clone().fill_(1) for k, v in state.items()}
+        out = traced_model(x)
+        traced_model.load_state_dict(new_state)
+        out_ones = traced_model(x)
+        traced_model.load_state_dict(state)
+        out_state = traced_model(x)
+        self.assertEqual(out, out_state)
+        self.assertNotEqual(out, out_ones)
+
 
 if __name__ == '__main__':
     run_tests()
